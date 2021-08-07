@@ -1,0 +1,407 @@
+#include "reg52.h"
+
+#define uchar unsigned char		   
+#define uint  unsigned int
+
+// 风扇端口定义,PWM输出端—>焊接的输入
+sbit motor_EN = P3^7;		//pwm波输出端口
+
+//手把手-数码管—38译码器
+sbit ADDR0 = P1^0;			// 数码管位选端口定义P1，段选端口:P2
+sbit ADDR1 = P1^1;
+sbit ADDR2 = P1^2;
+
+sbit ADDR3 = P1^3;
+sbit ENLED = P1^4;			//使能LED
+//按键矩阵-手把手
+sbit KEY_IN_1 = P2^4;
+sbit KEY_IN_2 = P2^5;
+sbit KEY_IN_3 = P2^6;
+sbit KEY_IN_4 = P2^7;
+sbit KEY_OUT_1 = P2^3;
+sbit KEY_OUT_2 = P2^2;
+sbit KEY_OUT_3 = P2^1;
+sbit KEY_OUT_4 = P2^0;
+
+unsigned char code LedChar[] = { //数码管显示字符转换表
+0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8,
+0x80, 0x90, 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
+};
+
+
+unsigned char KeySta[4][4] = { //全部矩阵按键的当前状态
+{1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}
+};
+unsigned char backup[4][4] = { //按键值备份，保存前一次的值
+{1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}
+};
+
+/*****全局变量定义*****/
+uint  speed_counter  = 0; 		// 编码器输出计数器
+uint  speed          = 0;		// 实际速度
+uint  set_speed      = 10;		// 设定速度
+uint  target_speed   = 10;		// 目标速度
+uint  PWM            = 0;		// PWM波占空比 PWM %
+int   pwm_reg        = 0;
+uchar motor_begin    = 0;		// 电机开始转动标志位 
+uchar PID_begin      = 0;		// PID计算标志位
+
+// PID相关参数 P I D 参数,2.0,0.6,0.4
+float Kp = 2.0, 							//Kp是加快系统响应速度，提高系统的调节精度
+      Ki = 1.0, 							//Ki用于消除稳态误差；
+      Kd = 0.4;               //Kd改善系统的稳态性能
+
+
+int   error = 0;              // 速度偏差
+int   last_error_1 = 0;       // 上一次速度偏差
+int   last_error_2 = 0;       // 上上一次速度偏差
+
+/*****函数声明*****/
+void display(uchar i, uchar number); 				// 显示函数
+void delay();   									// 延时函数
+void KeyScan();										// 按键扫描函数
+int  PID(uint tar_speed, uint real_speed); 			// PID调节函数
+
+
+// 函数名 主函数
+void main()
+{
+    P0 = 0x00; 
+    P1 = 0xf0;
+		TMOD = 0x01; 		//设置 T0 为模式 1
+		TH0 = 0xFC; 		//为 T0 赋初值 0xFC67，定时 1ms
+		TL0 = 0x67;
+		ET0 = 1; 			//使能 T0 中断
+		TR0 = 1; 			//启动 T0
+		EA  = 1;    		//打开总中断
+		IT0 = 1; 			// 设置外部中断0触发方式, 0为低电平触发 1为下降沿触发
+		EX0 = 1; 			// 打开外部中断0
+	
+    while(1)
+    {
+        KeyScan(); 	// 按键扫描
+		
+		// 显示实际速度
+		display(1,speed*60 / 100);			delay();//r/min
+		display(2,speed*60 % 100 / 10);	delay();
+		display(3,speed*60 % 10);			delay();
+		
+		// 显示设定速度
+		display(4,set_speed / 100);	    delay();//r/s
+		display(5,set_speed % 100 / 10);delay();
+		display(6,set_speed % 10);	    delay();
+		
+		// PWM更新
+		if(PID_begin == 1){
+			PWM = PID(target_speed, speed);
+			PID_begin = 0;
+		}
+	}
+}
+
+
+/**************************************
+// 函数名 PID调节函数
+// 参  数 tar_speed  目标速度
+//		  real_speed 实际速度
+// 返回值 pwm        PWM波占空比
+ **************************************/
+int PID(uint tar_speed, uint real_speed)
+{    
+    static int pwm_INC = 0, np = 0, ni = 0, nd = 0;
+    
+    // 计算pwm输出增量
+		error = tar_speed - real_speed;    
+    np = Kp * (error - last_error_1);
+    ni = Ki * error;
+    nd = Kd * (error - 2 * last_error_1 + last_error_2);
+    pwm_INC = np + ni + nd;
+    
+    pwm_reg = pwm_reg + pwm_INC;
+ 
+    last_error_2 = last_error_1;
+		last_error_1 = error;
+    
+    // 输出限幅
+	if(pwm_reg < 0)
+		pwm_reg = 0;
+	if(pwm_reg > 100)
+		pwm_reg = 100;
+    
+	pwm_INC = 0;
+    return pwm_reg;
+    
+}
+
+
+// 函数名 定时器0中断服务函数
+void TR0_isr() interrupt 1{
+	static uint i = 0;
+	static uint speed_control = 0;
+	
+    TH0 = 0xFF; // 定时器重装载值，定时100us
+    TL0 = 0x9C;
+	
+	i++;
+	speed_control++;		//
+	
+	// 霍尔元件采样周期 500ms-5000
+	if(i == 5000){	
+		speed = speed_counter/2;  //4个磁铁，半秒---*********************************************************
+		if(speed>15){ 			//限制速度
+			speed = 15;
+		}
+		speed_counter = 0;
+		i = 0;
+		if(motor_begin == 1) // PID计算一次
+			PID_begin = 1;
+	}
+	
+	// PWM波周期 10ms 频率 100Hz
+	if(speed_control <= PWM)
+			motor_EN = 0;
+	if(speed_control >  PWM)
+			motor_EN = 1;
+	if(speed_control >= 100)
+		speed_control = 0;
+}
+
+
+// 函数名 外部中断0服务函数------P3^2（外部中断0的引脚所在位置）
+void INT0_isr() interrupt 0 {
+	speed_counter++;		//霍尔传感器输出P3.2
+}
+
+
+// 函数名 延时1ms函数
+void delay(){
+	uchar i, j; 
+	for(i = 0; i < 10; i++) 
+		for(j = 0; j < 33; j++) ; 
+}
+
+
+// 函数名 按键扫描函数
+////////////按键布局//////////////
+//   1      2      3            确定键
+//   4      5      6      空              空
+//   7      8  		 9			清零键
+//        	0			 停止键    		开始键
+void KeyScan(){
+	static uchar ten_flag = 0;
+	P2 = 0x0f;		//P2初始化
+	
+	EA = 1; 		//使能总中断
+	ENLED = 0; 		//选择数码管 DS1 进行显示
+	ADDR3 = 1;
+	ADDR2 = 0;
+	ADDR1 = 0;
+	ADDR0 = 0;
+
+	if (P2 != 0x0f)
+	{
+		switch(P2)
+		{
+			//第一行按键按下
+			case 0x07: 
+				P2 = 0xf0;
+				switch(P2)
+				{
+					// 第一行第一个按键 数字1
+					case 0xe0 : 
+						if(ten_flag == 0) 
+						{
+							set_speed = 1;
+							ten_flag = 1;
+						}
+						else
+							set_speed = set_speed * 10 + 1 ; 
+					break;
+					// 第一行第二个按键 数字2	
+					case 0xd0 :
+						if(ten_flag == 0) 
+						{
+							set_speed = 2;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 2; 
+					break;	
+					// 第一行第三个按键 数字3
+					case 0xb0 : 						
+						if(ten_flag == 0) 
+						{
+							set_speed = 3;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 3; 
+					break;
+					// 第一行第四个按键 确定键
+					case 0x70 :
+						target_speed = set_speed;ten_flag=0; break;
+				} while(P2 != 0xf0); break;
+                
+			//第二行按键按下	
+			case 0x0b: 
+				P2 = 0xf0;
+				switch(P2)
+				{
+					// 第二行第一个按键 数字4
+					case 0xe0 : 
+						if(ten_flag == 0) 
+						{
+							set_speed = 4;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 4;
+					break;
+					// 第二行第二个按键 数字5
+					case 0xd0 :
+						if(ten_flag == 0) 
+						{
+							set_speed = 5;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 5;
+					break;
+					// 第二行第三个按键 数字6
+					case 0xb0 : 						
+						if(ten_flag == 0) 
+						{
+							set_speed = 6;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 6;
+					break;
+				}while(P2 != 0xf0); break;
+                
+			//第三行按键按下
+			case 0x0d: 
+				P2 = 0xf0;
+				switch(P2)
+				{
+					// 第三行第一个按键 数字7
+					case 0xe0 :
+						if(ten_flag == 0) 
+						{
+							set_speed = 7;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 +7; 
+					break;
+					// 第三行第二个按键 数字8
+					case 0xd0 : 
+						if(ten_flag == 0) 
+						{
+							set_speed = 8;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 8;
+					break;
+						// 第三行第三个按键 数字9
+					case 0xb0 : 
+						if(ten_flag == 0) 
+						{
+							set_speed =  9;
+							ten_flag = 1;
+						}
+						else 
+							set_speed = set_speed * 10 + 9;
+						break;
+					// 第三行第四个按键 清零键	
+					case 0x70 : set_speed = 0;ten_flag=0;break;
+				}while(P2 != 0xf0); break;
+                
+			//第四行按键按下
+			case 0x0e: 
+				P2 = 0xf0;
+				switch(P2)
+				{
+					// 第四行第一个按键 数字0
+					case 0xe0 :
+						if(ten_flag == 0) 
+						{
+							set_speed = 0;
+							ten_flag = 0;
+						}
+						else 
+							set_speed = set_speed * 10; 
+					break;
+					// 第四行第二个按键 停止键
+					case 0xd0 : 
+						motor_begin = 0; PWM = 0; pwm_reg = 0; 
+					break;
+					// 第四行第三个按键 开始键
+					case 0xb0 :  
+						motor_begin = 1; 
+					break;
+				} while(P2 != 0xf0);break;
+		}
+	}
+}
+
+/**************************************
+// 函数名 数码管显示函数 
+// 参  数 i : 选择第i个数码管显示 范围:1-6
+// 		  number : 显示数字number 范围:0-9
+// 返回值 无
+***************************************/
+
+void display(uchar i, uchar number){	//3-8译码器选择哪个数码管点亮
+	switch (i){
+		case 1 : ADDR0 = 1; ADDR1 = 0;ADDR2 = 1; break;
+		case 2 : ADDR0 = 0; ADDR1 = 0;ADDR2 = 1; break;
+		case 3 : ADDR0 = 1; ADDR1 = 1;ADDR2 = 0; break;
+		case 4 : ADDR0 = 0; ADDR1 = 1;ADDR2 = 0; break;
+		case 5 : ADDR0 = 1; ADDR1 = 0;ADDR2 = 0; break;
+		case 6 : ADDR0 = 0; ADDR1 = 0;ADDR2 = 0; break;
+	}
+	P0 = LedChar[number];
+}
+
+
+//-------------按键扫描定时中断--手把手
+void InterruptTimer0() interrupt 3{ //定时器3
+	unsigned char i;
+	static unsigned char keyout = 0; //矩阵按键扫描输出索引
+	static unsigned char keybuf[4][4] = { //矩阵按键扫描缓冲区
+	{0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF},
+	{0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}
+	};
+	TH1 = 0xFC; //重新加载初值
+	TL1 = 0x67;
+	//将一行的 4 个按键值移入缓冲区
+	keybuf[keyout][0] = (keybuf[keyout][0] << 1) | KEY_IN_1;
+	keybuf[keyout][1] = (keybuf[keyout][1] << 1) | KEY_IN_2;
+	keybuf[keyout][2] = (keybuf[keyout][2] << 1) | KEY_IN_3;
+	keybuf[keyout][3] = (keybuf[keyout][3] << 1) | KEY_IN_4;
+	//消抖后更新按键状态
+	for (i=0; i<4; i++) //每行 4 个按键，所以循环 4 次
+	{
+		if ((keybuf[keyout][i] & 0x0F) == 0x00)
+		{ //连续 4 次扫描值为 0，即 4*4ms 内都是按下状态时，可认为按键已稳定的按下
+			KeySta[keyout][i] = 0;
+		}
+		else if ((keybuf[keyout][i] & 0x0F) == 0x0F)
+		{ //连续 4 次扫描值为 1，即 4*4ms 内都是弹起状态时，可认为按键已稳定的弹起
+			KeySta[keyout][i] = 1;
+		}
+	}
+	//执行下一次的扫描输出
+	keyout++; //输出索引递增
+	keyout = keyout & 0x03; //索引值加到 4 即归零
+	switch (keyout) //根据索引，释放当前输出引脚，拉低下次的输出引脚
+	{
+		case 0: KEY_OUT_4 = 1; KEY_OUT_1 = 0; break;
+		case 1: KEY_OUT_1 = 1; KEY_OUT_2 = 0; break;
+		case 2: KEY_OUT_2 = 1; KEY_OUT_3 = 0; break;
+		case 3: KEY_OUT_3 = 1; KEY_OUT_4 = 0; break;
+		default: break;
+	}
+}
